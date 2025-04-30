@@ -10,14 +10,4 @@ users = [
 ]
 
 conn = sqlite3.connect(DB_PATH)
- c = conn.cursor()
-for email, password, api_key in users:
-    pw_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-    c.execute(
-        "INSERT INTO users (email, password, api_key) VALUES (?, ?, ?)",
-        (email, pw_hash, api_key)
-    )
-    print(f"✅ Inserted user: {email}")
-conn.commit()
-conn.close()
-print("🎉 All users created!")
+")
