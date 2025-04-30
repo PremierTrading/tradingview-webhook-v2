@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: tradingview-webhook-v2
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python init_db.py && python create_users_with_custom_api_keys.py && gunicorn app:app"
