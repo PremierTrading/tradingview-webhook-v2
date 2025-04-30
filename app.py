@@ -1,8 +1,9 @@
-# FILE: app.py
 import os
+import re
 import sqlite3
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+import bcrypt
 
 app = Flask(__name__)
 CORS(app)
@@ -21,20 +22,19 @@ def health():
 
 @app.route("/download-backup", methods=["GET"])
 def download_backup():
-    backup = os.path.join(BASE_DIR, "trades.db")
-    return send_file(backup, as_attachment=True)
+    return send_file(DB_PATH, as_attachment=True)
 
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
+    data = request.get_json(force=True)
     email = data.get("email")
     password = data.get("password")
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT api_key, password FROM users WHERE email = ?", (email,))
-    row = c.fetchone()
+    row = conn.execute(
+        "SELECT password, api_key FROM users WHERE email = ?", (email,)
+    ).fetchone()
     conn.close()
-    if row and bcrypt.checkpw(password.encode(), row["password"]):
+    if row and bcrypt.checkpw(password.encode("utf-8"), row["password"]):
         return jsonify(api_key=row["api_key"])
     return jsonify(error="Invalid credentials"), 401
 
@@ -42,46 +42,47 @@ def login():
 def webhook():
     body = request.get_json(force=True)
     msg = body.get("message", "")
-    # parse out fields
+    # split and strip
     lines = [l.strip() for l in msg.splitlines() if l.strip()]
+    # first line is symbol
+    symbol = lines[0].split()[0] if lines else None
+
+    # parse key: val lines into dict
     d = {}
-    for line in lines:
+    for line in lines[1:]:
         if ":" in line:
             key, val = line.split(":", 1)
             d[key.strip().lower().replace(" ", "_")] = val.strip()
-    # map Date → timestamp
-    timestamp = d.get("date") or d.get("Date")
-    symbol = lines[0].split()[0] if lines else ""
-    action = d.get("action")
-    entry = float(d.get("entry_price", 0))
-    exit_p = float(d.get("exit_price", 0))
+
+    timestamp = d.get("date")
+    action    = d.get("action")
+    entry     = float(d.get("entry_price", 0))
+    exit_p    = float(d.get("exit_price", 0))
     direction = d.get("direction")
-    result = d.get("result")
-    pnl = float(d.get("pnl", 0))
-    # insert into DB
+    result    = d.get("result")
+    pnl       = float(d.get("pnl", 0))
+
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("""
-      INSERT INTO trades
+    conn.execute("""
+      INSERT INTO trades 
         (symbol, action, entry_price, exit_price, direction, result, pnl, timestamp)
-      VALUES (?,?,?,?,?,?,?,?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (symbol, action, entry, exit_p, direction, result, pnl, timestamp))
     conn.commit()
     conn.close()
+
     return jsonify(status="received")
 
 @app.route("/trades", methods=["GET"])
 def get_trades():
     key = request.args.get("key")
-    # (you may want to verify the key against users table)
+    if not key:
+        return jsonify(error="API key required"), 400
+    # (optionally verify key here)
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades ORDER BY id DESC")
-    rows = c.fetchall()
+    rows = conn.execute("SELECT * FROM trades ORDER BY id DESC").fetchall()
     conn.close()
-    trades = [dict(row) for row in rows]
-    return jsonify(trades)
+    return jsonify([dict(r) for r in rows])
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-

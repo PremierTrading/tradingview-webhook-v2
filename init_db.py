@@ -26,10 +26,11 @@ CREATE TABLE IF NOT EXISTS trades (
     direction TEXT,
     result TEXT,
     pnl REAL,
-    date TEXT
+    timestamp TEXT
 );
 """)
 
 conn.commit()
 conn.close()
+
 print("Initialized trades.db with users and trades tables")
