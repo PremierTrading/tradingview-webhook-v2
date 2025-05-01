@@ -3,144 +3,127 @@ import time
 import threading
 import sqlite3
 import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Flask, request, jsonify, abort
 
 app = Flask(__name__)
-CORS(app)
 
-# ——— Token Auto-Refresh Manager —————————————————————————————————
-_token = None
-_expires_at = 0
-_lock = threading.Lock()
+# ────────────── CONFIG ─────────────────────────────────────────────────────────
+# Tradovate credentials & endpoints (set these in your Render environment)
+TRADOVATE_API_BASE    = os.getenv("TRADOVATE_API_BASE", "https://live.tradovateapi.com")
+TRADOVATE_USERNAME    = os.getenv("TRADOVATE_USERNAME")
+TRADOVATE_PASSWORD    = os.getenv("TRADOVATE_PASSWORD")
+TRADOVATE_SUB_ACCOUNT = os.getenv("TRADOVATE_SUB_ACCOUNT_ID")   # your sub-account spec ID
 
-def _fetch_new_token():
-    global _token, _expires_at
-    resp = requests.post(
-        "https://live.tradovateapi.com/auth/accessTokenRequest",
-        json={
-            "name": os.environ["TRADOVATE_USER"],
-            "password": os.environ["TRADOVATE_API_PASSWORD"],
-            "appId": "1",
-            "appVersion": "1.0",
-            "cid": os.environ["TRADOVATE_CID"],
-            "sec": os.environ["TRADOVATE_SECRET"],
-        },
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    token_value = data.get("access_token") or data.get("accessToken")
-    if not token_value:
-        raise RuntimeError(f"No access token in response: {data}")
-    _token = token_value
-    expires = data.get("expires_in", 3600)
-    _expires_at = time.time() + expires - 300
+if not all([TRADOVATE_USERNAME, TRADOVATE_PASSWORD, TRADOVATE_SUB_ACCOUNT]):
+    raise RuntimeError("Must set TRADOVATE_USERNAME, TRADOVATE_PASSWORD & TRADOVATE_SUB_ACCOUNT_ID")
 
-def _get_token():
-    with _lock:
-        if _token is None or time.time() >= _expires_at:
-            _fetch_new_token()
+# Path to your SQLite file created by init_db.py
+DB_PATH = os.getenv("DB_PATH", "trades.db")
+
+# In-memory cache for Tradovate token
+_token      = None
+_token_exp  = 0
+_token_lock = threading.Lock()
+
+
+# ────────────── HELPERS ────────────────────────────────────────────────────────
+def get_tradovate_token():
+    global _token, _token_exp
+    with _token_lock:
+        if _token and _token_exp > time.time():
+            return _token
+
+        resp = requests.post(
+            f"{TRADOVATE_API_BASE}/auth/authenticate",
+            json={"name": TRADOVATE_USERNAME, "password": TRADOVATE_PASSWORD}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        _token     = data["accessToken"]
+        # expiresIn is seconds until expiry; subtract 30s for safety
+        _token_exp = time.time() + data.get("expiresIn", 1800) - 30
         return _token
 
-# Pre-fetch on startup
-threading.Thread(target=_fetch_new_token, daemon=True).start()
-# ————————————————————————————————————————————————————————————————
+def is_valid_api_key(key: str) -> bool:
+    """Check `users` table for this key."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM users WHERE apiKey = ?", (key,))
+    valid = cur.fetchone() is not None
+    con.close()
+    return valid
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "trades.db")
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# ────────────── WEBHOOK ENDPOINT ───────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) Verify API key
+    # 1) Validate your TradingView key
     key = request.args.get("key", "")
-    if key != os.environ.get("WEBHOOK_API_KEY", ""):
-        return jsonify(error="invalid API key"), 401
+    if not is_valid_api_key(key):
+        return jsonify({"error": "Invalid API key"}), 401
 
-    # 2) Parse JSON
+    # 2) Parse & validate JSON payload
     try:
-        payload = request.get_json(force=True)
-    except Exception:
-        return jsonify(error="invalid JSON payload"), 400
+        p = request.get_json(force=True)
+    except:
+        return jsonify({"error": "Invalid JSON"}), 400
 
-    symbol = payload.get("symbol")
-    if not symbol:
-        return jsonify(error="missing symbol"), 400
+    required = ["symbol", "price", "action", "quantity", "orderType", "exchange", "timestamp"]
+    missing  = [f for f in required if f not in p]
+    if missing:
+        return jsonify({"error": "Missing field(s)", "fields": missing}), 400
 
-    # 3) Map action enum
-    raw_action = payload.get("action", "").strip().upper()
-    action_map = {"BUY": "Buy", "SELL": "Sell"}
-    action = action_map.get(raw_action)
-    if not action:
-        return jsonify(error="invalid action, must be BUY or SELL"), 400
+    # 3) Normalize & map enums
+    action = p["action"].strip().lower()
+    if action not in ("buy", "sell"):
+        return jsonify({"error": "Invalid action, must be buy or sell"}), 400
+    action = "Buy" if action == "buy" else "Sell"
 
-    # 4) Map orderType enum
-    raw_ot = payload.get("orderType", "").strip().upper()
-    ot_map = {"MKT": "Market", "LMT": "Limit", "MARKET": "Market", "LIMIT": "Limit"}
-    order_type = ot_map.get(raw_ot)
-    if not order_type:
-        return jsonify(error="invalid orderType, must be MKT/LMT or MARKET/LIMIT"), 400
+    otype = p["orderType"].strip().lower()
+    if otype not in ("market", "limit"):
+        return jsonify({"error": "Invalid orderType, use market or limit"}), 400
+    otype = "Market" if otype == "market" else "Limit"
 
-    # 5) Quantity
-    try:
-        qty = int(payload.get("quantity", 0))
-    except Exception:
-        return jsonify(error="invalid quantity"), 400
-    if qty <= 0:
-        return jsonify(error="quantity must be > 0"), 400
-
-    exchange = payload.get("exchange", "GLOBEX")
-
-    # 6) Build Tradovate request
-    token = _get_token()
-    body = {
-        "accountSpec": os.environ["TRADOVATE_USER"],
-        "accountId": int(os.environ["TRADOVATE_ACCOUNT_ID"]),
+    # 4) Build Tradovate order payload
+    order = {
+        "accountSpec": [
+            {
+                "accountSpecId": TRADOVATE_SUB_ACCOUNT,
+                "quantity": p["quantity"]
+            }
+        ],
         "action": action,
-        "symbol": symbol,
-        "orderQty": qty,
-        "orderType": order_type,
-        "exchange": exchange,
-        "isAutomated": True,
-    }
-    # Include price for limit orders
-    if order_type == "Limit":
-        try:
-            body["limitPrice"] = float(payload.get("price", 0))
-        except Exception:
-            return jsonify(error="missing or invalid price for limit order"), 400
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"  
+        "orderType": otype,
+        "timestamp": p["timestamp"],
+        "symbol": p["symbol"],
+        "exchange": p["exchange"],
+        "price": p["price"]
     }
 
-    # 7) Send to Tradovate
-    try:
-        r = requests.post(
-            "https://live.tradovateapi.com/v1/order/placeOrder",
-            json=body,
-            headers=headers,
-            timeout=10,
-        )
-        r.raise_for_status()
-        tradovate_resp = r.json()
-    except requests.exceptions.RequestException as e:
-        return jsonify(error="order failed", details=str(e)), 400
-
-    # 8) Log locally
-    db = get_db()
-    db.execute(
-        "INSERT INTO trades (symbol, action, entry_price, timestamp) VALUES (?,?,?,?)",
-        (symbol, action, float(payload.get("price", 0)), int(time.time()))
+    # 5) Send to Tradovate
+    token = get_tradovate_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.post(
+        f"{TRADOVATE_API_BASE}/v1/order/placeOrder",
+        json=order,
+        headers=headers
     )
-    db.commit()
-    db.close()
 
-    return jsonify(status="ok", tradovate=tradovate_resp), 200
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # bubble up Tradovate’s error text if any
+        return jsonify({
+            "error": "Tradovate order failed",
+            "details": resp.json()
+        }), resp.status_code
 
+    return jsonify(resp.json()), 200
+
+
+# ────────────── STARTUP ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000, debug=True)
+    # render listens on $PORT by default; fallback to 5000 locally
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
