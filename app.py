@@ -56,7 +56,7 @@ def _get_token():
             _fetch_new_token()
         return _token
 
-# kick off initial fetch in background
+# Start initial fetch in the background
 threading.Thread(target=_fetch_new_token, daemon=True).start()
 # ——————————————————————————————————————————————
 
@@ -70,47 +70,62 @@ def get_db():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    payload = request.get_json(force=True)
-    app.logger.info(f"Received alert: {payload}")
+    try:
+        # Simple API-key guard if you append ?key=… in the URL
+        key = request.args.get("key")
+        if key and key != os.environ.get("WEBHOOK_API_KEY"):
+            return jsonify(error="invalid API key"), 401
 
-    symbol    = payload.get("symbol")
-    action    = payload.get("action", "").upper()
-    qty       = int(payload.get("quantity", 0))
-    orderType = payload.get("orderType", "MKT")
-    exchange  = payload.get("exchange", "GLOBEX")
+        payload = request.get_json(force=True)
+        app.logger.info(f"Received alert: {payload}")
 
-    token = _get_token()
-    tradovate_resp = requests.post(
-        "https://live.tradovateapi.com/v1/order/place",
-        json={
-            "acctId":    int(os.environ["TRADOVATE_ACCOUNT_ID"]),
-            "conId":     symbol,
-            "orderQty":  qty,
-            "action":    action,
-            "orderType": orderType,
-            "secType":   "FUT",
-            "exchange":  exchange
-        },
-        headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-    )
-    tradovate_resp.raise_for_status()
-    order_result = tradovate_resp.json()
+        # Extract fields
+        symbol    = payload.get("symbol")
+        action    = payload.get("action", "").upper()
+        qty       = int(payload.get("quantity", 0))
+        orderType = payload.get("orderType", "MKT")
+        exchange  = payload.get("exchange", "GLOBEX")
 
-    db = get_db()
-    db.execute(
-        """INSERT INTO trades (symbol, action, entry_price, timestamp)
-           VALUES (?, ?, ?, ?)""",
-        (symbol, action, float(payload.get("price", 0)), int(time.time()))
-    )
-    db.commit()
-    db.close()
+        # Place the order
+        token = _get_token()
+        tradovate_resp = requests.post(
+            "https://live.tradovateapi.com/v1/order/place",
+            json={
+                "acctId":    int(os.environ["TRADOVATE_ACCOUNT_ID"]),
+                "conId":     symbol,
+                "orderQty":  qty,
+                "action":    action,
+                "orderType": orderType,
+                "secType":   "FUT",
+                "exchange":  exchange
+            },
+            headers={
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {token}"
+            }
+        )
+        tradovate_resp.raise_for_status()
+        order_result = tradovate_resp.json()
 
-    return jsonify(status="ok", tradovate=order_result), 200
+        # Log into SQLite
+        db = get_db()
+        db.execute(
+            """INSERT INTO trades (symbol, action, entry_price, timestamp)
+               VALUES (?, ?, ?, ?)""",
+            (symbol, action, float(payload.get("price", 0)), int(time.time()))
+        )
+        db.commit()
+        db.close()
 
-# ... rest of your routes unchanged ...
+        return jsonify(status="ok", tradovate=order_result), 200
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        app.logger.error(tb)
+        return jsonify(error=str(e), traceback=tb), 500
+
+# ... keep your other routes (health, register, login, trades, download-backup) unchanged ...
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
