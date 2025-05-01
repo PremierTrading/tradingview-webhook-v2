@@ -74,7 +74,7 @@ def webhook():
         # 2) Parse TradingView payload
         payload = request.get_json(force=True)
         symbol = payload["symbol"]
-        action = payload["action"].upper()       # "BUY" or "SELL"
+        action = payload["action"].lower()       # "BUY" or "SELL"
         qty    = int(payload["quantity"])
         price  = float(payload.get("price", 0))
         ts     = int(payload["timestamp"])
