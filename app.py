@@ -89,7 +89,7 @@ def webhook():
         # Place the order
         token = _get_token()
         tradovate_resp = requests.post(
-            "https://live.tradovateapi.com/v1/order/place",
+            "https://live.tradovateapi.com/v1/order/placeOrder",
             json={
                 "acctId":    int(os.environ["TRADOVATE_ACCOUNT_ID"]),
                 "conId":     symbol,
