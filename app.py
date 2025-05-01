@@ -1,4 +1,3 @@
-# FILE: app.py
 import os
 import sqlite3
 import time
@@ -10,7 +9,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# ——— Token Auto-Refresh Manager ——————————————————
+# ——— Token Auto-Refresh Manager ———————————————————
 _token      = None
 _expires_at = 0
 _lock       = threading.Lock()
@@ -18,12 +17,13 @@ _lock       = threading.Lock()
 def _fetch_new_token():
     global _token, _expires_at
     resp = requests.post(
-        "https://live.tradovateapi.com/auth/accessTokenRequest",
+        "https://live.tradovateapi.com/v1/auth/accesstokenrequest",
         json={
             "name":       os.environ["TRADOVATE_USER"],
             "password":   os.environ["TRADOVATE_API_PASSWORD"],
-            "appId":      "1",
-            "appVersion": "1.0",
+            "appId":      "tradingview",
+            "appVersion": "0.0.1",
+            "deviceId":   os.environ.get("TRADOVATE_DEVICE_ID", ""),
             "cid":        os.environ["TRADOVATE_CID"],
             "sec":        os.environ["TRADOVATE_SECRET"],
         },
@@ -36,14 +36,15 @@ def _fetch_new_token():
         raise RuntimeError(f"No access token in response: {data}")
     _token = token_value
 
-    if "expires_in" in data:
-        _expires_at = time.time() + data["expires_in"] - 300
-    elif "expirationTime" in data:
-        from datetime import datetime, timezone
-        exp_dt = datetime.fromisoformat(data["expirationTime"].replace("Z", "+00:00"))
-        _expires_at = exp_dt.replace(tzinfo=timezone.utc).timestamp() - 300
+    # expires_in is in seconds
+    expires_in = data.get("expires_in") or data.get("expirationTime")
+    if isinstance(expires_in, (int, float)):
+        _expires_at = time.time() + expires_in - 300
     else:
-        _expires_at = time.time() + 3600 - 300
+        # ISO datetime
+        from datetime import datetime, timezone
+        exp_dt = datetime.fromisoformat(expires_in.replace("Z", "+00:00"))
+        _expires_at = exp_dt.replace(tzinfo=timezone.utc).timestamp() - 300
 
 def _get_token():
     with _lock:
@@ -51,9 +52,9 @@ def _get_token():
             _fetch_new_token()
         return _token
 
-# kick off initial fetch
+# Kick off the first fetch in background
 threading.Thread(target=_fetch_new_token, daemon=True).start()
-# ——————————————————————————————————————————————
+# ————————————————————————————————————————————————
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "trades.db")
 
@@ -65,49 +66,52 @@ def get_db():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # API‐key guard
+        # 1) Verify your own webhook key
         key = request.args.get("key", "")
         if key != os.environ.get("WEBHOOK_API_KEY", ""):
             return jsonify(error="invalid API key"), 401
 
-        p = request.get_json(force=True)
-        app.logger.info(f"Alert payload: {p}")
+        # 2) Parse TradingView payload
+        payload = request.get_json(force=True)
+        symbol = payload["symbol"]
+        action = payload["action"].upper()       # "BUY" or "SELL"
+        qty    = int(payload["quantity"])
+        price  = float(payload.get("price", 0))
+        ts     = int(payload["timestamp"])
 
-        symbol = p.get("symbol")
-        action = p.get("action", "").capitalize()   # e.g. "Buy" or "Sell"
-        qty    = int(p.get("quantity", 0))
-
-        # place market order
+        # 3) Place order on Tradovate
         token = _get_token()
-        r = requests.post(
+        order_req = {
+            "accountId":   int(os.environ["TRADOVATE_ACCOUNT_ID"]),
+            "accountSpec": os.environ["TRADOVATE_ACCOUNT_SPEC"],
+            "symbol":      symbol,
+            "action":      action,
+            "quantity":    qty,
+            "orderType":   payload.get("orderType", "MKT"),
+            "exchange":    payload.get("exchange", "GLOBEX"),
+            "timestamp":   ts
+        }
+        resp = requests.post(
             "https://live.tradovateapi.com/v1/order/placeOrder",
-            json={
-                "accountSpec": os.environ["TRADOVATE_USER"],
-                "accountId":   int(os.environ["TRADOVATE_ACCOUNT_ID"]),
-                "action":      action,
-                "symbol":      symbol,
-                "orderQty":    qty,
-                "orderType":   "Market",
-                "isAutomated": True
-            },
+            json=order_req,
             headers={
                 "Content-Type":  "application/json",
                 "Authorization": f"Bearer {token}"
             }
         )
-        r.raise_for_status()
-        order_result = r.json()
+        resp.raise_for_status()
+        result = resp.json()
 
-        # optionally log locally
+        # 4) Log the trade locally (optional)
         db = get_db()
         db.execute(
             "INSERT INTO trades (symbol, action, entry_price, timestamp) VALUES (?, ?, ?, ?)",
-            (symbol, action, float(p.get("price", 0)), int(time.time()))
+            (symbol, action, price, int(time.time()))
         )
         db.commit()
         db.close()
 
-        return jsonify(status="ok", result=order_result), 200
+        return jsonify(status="ok", result=result), 200
 
     except Exception as e:
         import traceback
@@ -115,8 +119,5 @@ def webhook():
         app.logger.error(tb)
         return jsonify(error=str(e), traceback=tb), 500
 
-# ... your other routes unchanged ...
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=True)
-
