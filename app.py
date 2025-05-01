@@ -1,129 +1,132 @@
+# FILE: app.py
 import os
+import sqlite3
 import time
 import threading
-import sqlite3
 import requests
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
-# ────────────── CONFIG ─────────────────────────────────────────────────────────
-# Tradovate credentials & endpoints (set these in your Render environment)
-TRADOVATE_API_BASE    = os.getenv("TRADOVATE_API_BASE", "https://live.tradovateapi.com")
-TRADOVATE_USERNAME    = os.getenv("TRADOVATE_USERNAME")
-TRADOVATE_PASSWORD    = os.getenv("TRADOVATE_PASSWORD")
-TRADOVATE_SUB_ACCOUNT = os.getenv("TRADOVATE_SUB_ACCOUNT_ID")   # your sub-account spec ID
+# —— Token & Account Auto-Refresh Manager ——
+_token = None
+_expires_at = 0
+_lock = threading.Lock()
+_account_info = {}
 
-if not all([TRADOVATE_USERNAME, TRADOVATE_PASSWORD, TRADOVATE_SUB_ACCOUNT]):
-    raise RuntimeError("Must set TRADOVATE_USERNAME, TRADOVATE_PASSWORD & TRADOVATE_SUB_ACCOUNT_ID")
+def _fetch_new_token():
+    global _token, _expires_at, _account_info
+    # 1) Authenticate and get access token
+    resp = requests.post(
+        "https://live.tradovateapi.com/auth/accessTokenRequest",
+        json={
+            "name":       os.environ["TRADOVATE_USER"],
+            "password":   os.environ["TRADOVATE_API_PASSWORD"],
+            "appId":      "1",
+            "appVersion": "1.0",
+            "cid":        os.environ["TRADOVATE_CID"],
+            "sec":        os.environ["TRADOVATE_SECRET"],
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    token_value = data.get("access_token") or data.get("accessToken")
+    if not token_value:
+        raise RuntimeError(f"No access token in response: {data}")
+    _token = token_value
+    # schedule renewal 5m before expiry
+    expires_in = data.get("expires_in")
+    _expires_at = time.time() + (expires_in or 3600) - 300
 
-# Path to your SQLite file created by init_db.py
-DB_PATH = os.getenv("DB_PATH", "trades.db")
-
-# In-memory cache for Tradovate token
-_token      = None
-_token_exp  = 0
-_token_lock = threading.Lock()
-
-
-# ────────────── HELPERS ────────────────────────────────────────────────────────
-def get_tradovate_token():
-    global _token, _token_exp
-    with _token_lock:
-        if _token and _token_exp > time.time():
-            return _token
-
-        resp = requests.post(
-            f"{TRADOVATE_API_BASE}/auth/authenticate",
-            json={"name": TRADOVATE_USERNAME, "password": TRADOVATE_PASSWORD}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        _token     = data["accessToken"]
-        # expiresIn is seconds until expiry; subtract 30s for safety
-        _token_exp = time.time() + data.get("expiresIn", 1800) - 30
-        return _token
-
-def is_valid_api_key(key: str) -> bool:
-    """Check `users` table for this key."""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM users WHERE apiKey = ?", (key,))
-    valid = cur.fetchone() is not None
-    con.close()
-    return valid
-
-
-# ────────────── WEBHOOK ENDPOINT ───────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    # 1) Validate your TradingView key
-    key = request.args.get("key", "")
-    if not is_valid_api_key(key):
-        return jsonify({"error": "Invalid API key"}), 401
-
-    # 2) Parse & validate JSON payload
-    try:
-        p = request.get_json(force=True)
-    except:
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    required = ["symbol", "price", "action", "quantity", "orderType", "exchange", "timestamp"]
-    missing  = [f for f in required if f not in p]
-    if missing:
-        return jsonify({"error": "Missing field(s)", "fields": missing}), 400
-
-    # 3) Normalize & map enums
-    action = p["action"].strip().lower()
-    if action not in ("buy", "sell"):
-        return jsonify({"error": "Invalid action, must be buy or sell"}), 400
-    action = "Buy" if action == "buy" else "Sell"
-
-    otype = p["orderType"].strip().lower()
-    if otype not in ("market", "limit"):
-        return jsonify({"error": "Invalid orderType, use market or limit"}), 400
-    otype = "Market" if otype == "market" else "Limit"
-
-    # 4) Build Tradovate order payload
-    order = {
-        "accountSpec": [
-            {
-                "accountSpecId": TRADOVATE_SUB_ACCOUNT,
-                "quantity": p["quantity"]
-            }
-        ],
-        "action": action,
-        "orderType": otype,
-        "timestamp": p["timestamp"],
-        "symbol": p["symbol"],
-        "exchange": p["exchange"],
-        "price": p["price"]
+    # 2) Fetch session to auto-discover your accountSpec and accountId
+    sess = requests.get(
+        "https://live.tradovateapi.com/auth/session",
+        headers={"Authorization": f"Bearer {_token}"}
+    )
+    sess.raise_for_status()
+    sess_data = sess.json()
+    default = sess_data.get("defaultAccount", sess_data)
+    _account_info = {
+        "accountId":   int(default.get("accountId") or default.get("acctId")),
+        "accountSpec": default.get("accountSpec"),
+        "subAccountId": default.get("subAccountId"),
     }
 
-    # 5) Send to Tradovate
-    token = get_tradovate_token()
-    headers = {"Authorization": f"Bearer {token}"}
+
+def _get_token():
+    with _lock:
+        if _token is None or time.time() >= _expires_at:
+            _fetch_new_token()
+        return _token
+
+# Pre-fetch on startup
+threading.Thread(target=_fetch_new_token, daemon=True).start()
+# ————————————————————————————————————————
+
+# —— Database Setup ——
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(BASE_DIR, "trades.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# —— Webhook Endpoint ——
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # 1) Validate your own TradingView key
+    key = request.args.get("key", "")
+    if key != os.environ.get("WEBHOOK_API_KEY", ""):
+        return jsonify(error="invalid API key"), 401
+
+    # 2) Parse TradingView JSON payload
+    p = request.get_json(force=True)
+    symbol = p.get("symbol")
+    # Standardize action to "Buy"/"Sell"
+    action = p.get("action", "").capitalize()
+    qty    = int(p.get("quantity", 0))
+    price  = float(p.get("price", 0))
+    # Map MKT/LMT → full enum
+    ot = p.get("orderType", "MKT").upper()
+    order_type = "Market" if ot == "MKT" else "Limit"
+    exchange = p.get("exchange", "GLOBEX")
+
+    # 3) Place order on Tradovate
+    token = _get_token()
+    body = {
+        "accountId":   _account_info["accountId"],
+        "accountSpec": _account_info["accountSpec"],
+        "action":      action,
+        "symbol":      symbol,
+        "quantity":    qty,
+        "orderType":   order_type,
+        "exchange":    exchange,
+    }
     resp = requests.post(
-        f"{TRADOVATE_API_BASE}/v1/order/placeOrder",
-        json=order,
-        headers=headers
+        "https://live.tradovateapi.com/v1/order/placeOrder",
+        json=body,
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {token}"
+        }
     )
+    resp.raise_for_status()
+    result = resp.json()
 
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        # bubble up Tradovate’s error text if any
-        return jsonify({
-            "error": "Tradovate order failed",
-            "details": resp.json()
-        }), resp.status_code
+    # 4) Log locally
+    db = get_db()
+    db.execute(
+        "INSERT INTO trades (symbol, action, entry_price, timestamp) VALUES (?, ?, ?, ?)",
+        (symbol, action, price, int(time.time()))
+    )
+    db.commit()
+    db.close()
 
-    return jsonify(resp.json()), 200
+    return jsonify(status="ok", result=result), 200
 
-
-# ────────────── STARTUP ────────────────────────────────────────────────────────
+# —— Main ——
 if __name__ == "__main__":
-    # render listens on $PORT by default; fallback to 5000 locally
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
