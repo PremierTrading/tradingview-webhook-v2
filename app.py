@@ -36,15 +36,14 @@ def _fetch_new_token():
         raise RuntimeError(f"No access token in response: {data}")
     _token = token_value
 
-    # expires_in is in seconds
     expires_in = data.get("expires_in") or data.get("expirationTime")
     if isinstance(expires_in, (int, float)):
         _expires_at = time.time() + expires_in - 300
     else:
-        # ISO datetime
         from datetime import datetime, timezone
         exp_dt = datetime.fromisoformat(expires_in.replace("Z", "+00:00"))
         _expires_at = exp_dt.replace(tzinfo=timezone.utc).timestamp() - 300
+
 
 def _get_token():
     with _lock:
@@ -74,12 +73,12 @@ def webhook():
         # 2) Parse TradingView payload
         payload = request.get_json(force=True)
         symbol = payload["symbol"]
-        action = payload["action"].lower()       # "BUY" or "SELL"
+        action = payload["action"].lower()       # MUST be lowercase
         qty    = int(payload["quantity"])
         price  = float(payload.get("price", 0))
-        ts     = int(payload["timestamp"])
+        ts     = int(payload.get("timestamp", time.time() * 1000))
 
-        # 3) Place order on Tradovate
+        # 3) Build order request
         token = _get_token()
         order_req = {
             "accountId":   int(os.environ["TRADOVATE_ACCOUNT_ID"]),
@@ -99,7 +98,17 @@ def webhook():
                 "Authorization": f"Bearer {token}"
             }
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            # Return full Tradovate error for debugging
+            try:
+                details = resp.json()
+            except ValueError:
+                details = resp.text
+            return jsonify(
+                error="Bad Request",
+                details=details
+            ), resp.status_code
+
         result = resp.json()
 
         # 4) Log the trade locally (optional)
