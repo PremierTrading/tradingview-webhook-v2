@@ -73,7 +73,7 @@ def webhook():
         # 2) Parse TradingView payload
         payload = request.get_json(force=True)
         symbol = payload["symbol"]
-        action = payload["action"].lower()       # MUST be lowercase
+        action = payload["action"].upper()     # MUST be uppercase
         qty    = int(payload["quantity"])
         price  = float(payload.get("price", 0))
         ts     = int(payload.get("timestamp", time.time() * 1000))
@@ -111,7 +111,7 @@ def webhook():
 
         result = resp.json()
 
-        # 4) Log the trade locally (optional)
+        # 4) Log the trade locally
         db = get_db()
         db.execute(
             "INSERT INTO trades (symbol, action, entry_price, timestamp) VALUES (?, ?, ?, ?)",
